@@ -2,8 +2,8 @@
 // Speaks the modern 2026-07-28 era (server/discover) and the legacy handshake (initialize).
 // Tools mirror github-mcp-server's names; results carry the object JSON as text content.
 
-import { addComment, createIssue, createLabel, createPull, findLabel, getIssue, getPull, issueRelayId, mergePull, pullRelayId, repoRelayId } from './domain.ts';
-import { prFiles, resolveCommit } from './store.ts';
+import { addComment, createIssue, createPull, getIssue, getPull, mergePull } from './domain.ts';
+import { VIEWER_LOGIN } from './store.ts';
 import type { Store } from './store.ts';
 
 export const MCP_SERVER_NAME = 'makefun-github-core-clone';

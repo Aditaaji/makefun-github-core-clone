@@ -21,6 +21,7 @@ import {
   readPack,
   sideband,
   splitAtFlush,
+  treeObjects,
   verifyPackChecksum,
   writePack,
 } from './git.ts';
@@ -34,7 +35,7 @@ import {
   VIEWER_NAME,
   buildTree,
   commitFiles,
-  historyPresent,
+  historyPresentVerified,
   isFastForward,
   nextTimestamp,
   peelToCommit,
@@ -784,7 +785,7 @@ function handleContents(req: IncomingMessage, res: ServerResponse, route: Route,
     }
     const blobOid = storeObject(repo, 'blob', content);
     files.set(filePath, blobOid);
-    const commitOid = commitFiles(repo, branch, files, `${message}\n`);
+    const commitOid = commitFiles(repo, branch, files, message);
     const ts = nextTimestamp();
     sendJson(res, existing === undefined ? 201 : 200, {
       content: { name: filePath.split('/').pop() ?? filePath, path: filePath, sha: blobOid, size: content.length, type: 'file', encoding: 'base64', url: `/api/v3/repos/${repo.owner}/${repo.name}/contents/${filePath}` },
@@ -814,7 +815,7 @@ function handleContents(req: IncomingMessage, res: ServerResponse, route: Route,
       return;
     }
     files.delete(filePath);
-    const commitOid = commitFiles(repo, branch, files, `${message}\n`);
+    const commitOid = commitFiles(repo, branch, files, message);
     const ts = nextTimestamp();
     sendJson(res, 200, {
       commit: { sha: commitOid, message, author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: ts.iso }, committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: ts.iso }, url: `/api/v3/repos/${repo.owner}/${repo.name}/commits/${commitOid}` },
@@ -1111,12 +1112,31 @@ function computeFetch(
   depth: number | null,
 ): FetchPlan {
   const objects = new Map<string, GitObject>();
-  const haveClosure = new Set<string>();
-  for (const h of haves) {
-    for (const c of commitClosure(repo, h)) haveClosure.add(c);
-    haveClosure.add(h);
-  }
   const shallowSet = new Set(shallowBoundaries);
+  // Commits the client holds: a have's history, stopping at shallow boundaries (a shallow tip's
+  // parents are NOT held — that is what makes a deepen possible).
+  const haveClosure = new Set<string>();
+  const heldObjects = new Set<string>();
+  for (const h of haves) {
+    const stack = [h];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (haveClosure.has(oid)) continue;
+      const commit = getCommit(repo.objects, oid);
+      if (commit === null) continue;
+      haveClosure.add(oid);
+      for (const o of treeObjects(repo.objects, commit.tree)) heldObjects.add(o);
+      if (shallowSet.has(oid)) continue;
+      for (const p of commit.parents) stack.push(p);
+    }
+  }
+  // A shallow boundary tip: the client holds the tip commit and its tree, not its history.
+  for (const s of shallowBoundaries) {
+    const commit = getCommit(repo.objects, s);
+    if (commit === null) continue;
+    heldObjects.add(s);
+    for (const o of treeObjects(repo.objects, commit.tree)) heldObjects.add(o);
+  }
   const included = new Set<string>(); // commit oids whose objects we send
   const boundary = new Set<string>(); // included commits at the edge (shallow)
   const wantTags = new Set<string>();
@@ -1124,17 +1144,19 @@ function computeFetch(
   const addCommitAndTree = (oid: string): void => {
     const commit = getCommit(repo.objects, oid);
     if (commit === null) return;
-    if (!objects.has(oid)) {
+    if (!heldObjects.has(oid)) {
       const obj = repo.objects.get(oid);
       if (obj !== undefined) objects.set(oid, obj);
     }
-    const treeObj = repo.objects.get(commit.tree);
-    if (treeObj !== undefined) objects.set(commit.tree, treeObj);
-    // Include every tree object on the path, not just the root: walk the tree.
+    // Include every tree object on the path, not just the root — except objects the client holds
+    // (a held tree's whole subtree is held, so it can be skipped wholesale).
     const walkTree = (treeOid: string): void => {
+      if (heldObjects.has(treeOid)) return;
       const tree = repo.objects.get(treeOid);
       if (tree === undefined || tree.type !== 'tree') return;
+      objects.set(treeOid, tree);
       for (const entry of parseTree(tree.data)) {
+        if (heldObjects.has(entry.oid)) continue;
         const child = repo.objects.get(entry.oid);
         if (child === undefined) continue;
         objects.set(entry.oid, child);
@@ -1199,7 +1221,7 @@ function computeFetch(
   // Wanted tags: include the tag object and its target's history.
   for (const tagOid of wantTags) {
     const tag = repo.objects.get(tagOid);
-    if (tag !== undefined) objects.set(tagOid, tag);
+    if (tag !== undefined && !heldObjects.has(tagOid)) objects.set(tagOid, tag);
     if (tag?.type === 'tag') {
       const target = parseTag(tag.data).object;
       const targetCommit = getCommit(repo.objects, target);
@@ -1508,7 +1530,7 @@ function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repo
         results.push({ ref: c.ref, ok: false, reason: 'unpacker error' });
         continue;
       }
-      if (!historyPresent(repo, c.newOid)) {
+      if (!historyPresentVerified(repo, c.newOid)) {
         results.push({ ref: c.ref, ok: false, reason: 'unpacker error' });
         continue;
       }

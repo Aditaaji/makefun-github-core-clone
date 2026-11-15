@@ -304,16 +304,40 @@ export function readPack(
   return { objects, deltaCount };
 }
 
-/** Bytes the zlib stream starting at `pos` consumed (inflateSync gives no length, so find it). */
+/** Adler-32 (the checksum a zlib stream ends with). */
+export function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % MOD;
+    b = (b + a) % MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Bytes the zlib stream starting at `pos` consumed. A zlib stream ends with the Adler-32 of its
+ * uncompressed bytes, so the end is where those four bytes sit; a prefix inflation verifies the
+ * candidate (a coincidental match inside the deflate data fails it and the search continues).
+ * Falls back to a binary search when no candidate verifies.
+ */
 function consumedDeflate(pack: Buffer, pos: number): number {
-  // A zlib stream ends with an adler32; the deflate stream's end is found by trial inflation of
-  // increasing slices — expensive in general, but packs here are small. Use a binary search on the
-  // smallest prefix that inflates cleanly to the expected size is not available; instead inflate the
-  // whole tail once per object is wrong. We locate the end by scanning: inflateSync on a truncated
-  // buffer throws, so binary-search the minimal length that inflates without error.
-  let lo = 2;
-  let hi = pack.length - pos;
-  // Fast path: most streams end well before the tail; exponential probe then binary search.
+  const tail = pack.subarray(pos);
+  const data = inflateSync(tail);
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let idx = tail.indexOf(needle, 2);
+  while (idx >= 0) {
+    const end = idx + 4;
+    try {
+      if (inflateSync(tail.subarray(0, end)).equals(data)) return end;
+    } catch {
+      // not the stream end; keep looking
+    }
+    idx = tail.indexOf(needle, idx + 1);
+  }
+  // Fallback: binary-search the minimal prefix that inflates cleanly.
   const tryInflate = (len: number): boolean => {
     try {
       inflateSync(pack.subarray(pos, pos + len));
@@ -322,11 +346,11 @@ function consumedDeflate(pack: Buffer, pos: number): number {
       return false;
     }
   };
-  if (!tryInflate(hi)) throw new Error('corrupt deflate stream in pack');
+  if (!tryInflate(tail.length)) throw new Error('corrupt deflate stream in pack');
   let probe = 2;
-  while (probe < hi && !tryInflate(probe)) probe *= 2;
-  lo = Math.floor(probe / 2);
-  hi = Math.min(hi, probe);
+  while (probe < tail.length && !tryInflate(probe)) probe *= 2;
+  let lo = Math.floor(probe / 2);
+  let hi = Math.min(tail.length, probe);
   while (lo + 1 < hi) {
     const mid = Math.floor((lo + hi) / 2);
     if (tryInflate(mid)) hi = mid;
@@ -500,6 +524,44 @@ export function mergeBase(objects: ObjectMap, a: string, b: string): string | nu
 export function isAncestor(objects: ObjectMap, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
   return commitClosure(objects, [descendant]).has(ancestor);
+}
+
+/** All object oids in a tree: the tree itself, every subtree, every blob. */
+export function treeObjects(objects: ObjectMap, treeOid: string): Set<string> {
+  const out = new Set<string>();
+  const stack = [treeOid];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (out.has(oid)) continue;
+    const obj = objects.get(oid);
+    if (obj === undefined) continue;
+    out.add(oid);
+    if (obj.type === 'tree') {
+      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+    }
+  }
+  return out;
+}
+
+/** All object oids reachable from `tips`: commits (parents), trees, blobs, tag targets. */
+export function reachableObjects(objects: ObjectMap, tips: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  const stack = [...tips];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (out.has(oid)) continue;
+    const obj = objects.get(oid);
+    if (obj === undefined) continue;
+    out.add(oid);
+    if (obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      for (const o of treeObjects(objects, commit.tree)) out.add(o);
+      for (const p of commit.parents) stack.push(p);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    }
+  }
+  return out;
 }
 
 /** Flatten a tree (by oid) into path -> {oid, mode}. */

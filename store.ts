@@ -108,6 +108,8 @@ export interface Repo {
   updatedAt: string;
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
+  /** Commit oids whose whole history is known present (memoizes push validation). */
+  verifiedCommits: Set<string>;
   issues: Issue[];
   labels: Label[];
   pulls: PullRequest[];
@@ -151,6 +153,7 @@ export class Store {
       updatedAt: ts.iso,
       objects: new Map(),
       refs: new Map(),
+      verifiedCommits: new Set(),
       issues: [],
       labels: [],
       pulls: [],
@@ -252,6 +255,7 @@ export function commitFiles(
   const line = authorLine();
   const view: CommitView = { tree: treeOid, parents: parent === null ? [] : [parent], author: line, committer: line, message };
   const oid = storeObject(repo, 'commit', encodeCommit(view));
+  repo.verifiedCommits.add(oid);
   repo.refs.set(ref, oid);
   return oid;
 }
@@ -366,34 +370,52 @@ export function squashMerge(repo: Repo, pr: PullRequest): string | null {
     parents: [baseTip],
     author: line,
     committer: line,
-    message: `${pr.title} (#${pr.number})\n`,
+    message: `${pr.title} (#${pr.number})`,
   };
   const oid = storeObject(repo, 'commit', encodeCommit(view));
+  repo.verifiedCommits.add(oid);
   repo.refs.set(`refs/heads/${pr.baseRef}`, oid);
   return oid;
 }
 
-/** Is `tip` a fast-forward from `old` (old is an ancestor of tip, or old is zero)? */
+/** Is `tip` a fast-forward from `old` (old is an ancestor of tip, or old is zero)? Walks up from the
+ * tip and stops as soon as `old` is found, so the common linear case costs one step. */
 export function isFastForward(repo: Repo, oldOid: string, newOid: string): boolean {
   if (oldOid === ZERO_OID) return true;
-  return isAncestor(repo.objects, oldOid, newOid);
-}
-
-/** Validate that a pushed commit's history is present: every parent reachable from `oid` exists. */
-export function historyPresent(repo: Repo, oid: string): boolean {
-  const stack = [oid];
+  const stack = [newOid];
   const seen = new Set<string>();
   while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (oid === oldOid) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const commit = getCommit(repo.objects, oid);
+    if (commit === null) continue;
+    for (const p of commit.parents) stack.push(p);
+  }
+  return false;
+}
+
+/** Validate that a pushed commit's history is present, stopping at already-verified commits.
+ * Newly verified commits are memoized on success only. */
+export function historyPresentVerified(repo: Repo, oid: string): boolean {
+  const stack = [oid];
+  const seen = new Set<string>();
+  const newly: string[] = [];
+  while (stack.length > 0) {
     const cur = stack.pop()!;
-    if (seen.has(cur)) continue;
+    if (seen.has(cur) || repo.verifiedCommits.has(cur)) continue;
     seen.add(cur);
     const obj = repo.objects.get(cur);
     if (obj === undefined) return false;
     if (obj.type === 'commit') {
+      newly.push(cur);
       for (const p of parseCommit(obj.data).parents) stack.push(p);
     } else if (obj.type === 'tag') {
       stack.push(parseTag(obj.data).object);
     }
   }
+  for (const c of newly) repo.verifiedCommits.add(c);
   return true;
 }
+
