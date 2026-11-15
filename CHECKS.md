@@ -33,3 +33,30 @@ Command: `node cli/makefun.mjs grade-local --kit . --bot ~/workspace/makefun/git
 
 - ranked: yes; prize: no; efficiency: no — all three "no"s are the missing transcripts (`no_transcripts`, `coverage_below_gate`, `cost_unpriced`), fixed by bundling the build session (see TRANSCRIPTS.md).
 - Scored round: every entry runs 1 scored instance; top 60 (+ ties) run all 3, ranked on mean; must beat the house reference forge with a 90% paired t-interval > 0 to take a prize.
+
+## Perf push — grade-local 3-trial means (this session, same VM)
+
+Baseline fresh (grade-local-baseline, HEAD adf0163, VM loaded by other builders):
+mean 918 (perf 118, p50 630993) — push 1125 ms, clone 283 ms, read 1921 ms, write 262 ms.
+
+Optimizations (committed here):
+- Fetch-pack + ls-refs + info/refs response cache in app.ts, keyed by request +
+  repo.gitVersion; bumpGit() clears it on every objects/refs mutation (storeObject,
+  commitFiles, squashMerge, REST ref create, receive-pack). Objects are
+  content-addressed and append-only, so a version-keyed cache cannot go stale.
+- readPack inflate merge in git.ts: one helper returns data + consumed length,
+  2 inflates per object instead of 3.
+- v2 advertisement built once as a module constant.
+
+A/B control, same load (old code stashed, grade-local-baseline2):
+- Old code mean **979** (perf 179, p50 267802): push 451, clone 111, read 850, write 122 ms.
+- New code run 1 (grade-local-perf1): mean **970** (perf 170, p50 307697).
+- New code run 2 (grade-local-perf2): mean **980** (perf 180, p50 258157).
+- New code 6-trial combined: mean ~975, perf ~175 — within run-to-run noise of
+  the old code (trials range 958–986). Feature 600/600 and agent 200/200 in all
+  9 trials; replays matched. Conclusion: the changes maintain the mean locally.
+  The local harness shows the real effect under CPU load: clone fetch phase
+  211 ms -> 24 ms for 50 concurrent clones (pack cache); under light load the
+  fetch handler is not the bottleneck, so grade-local clone is unchanged
+  (~111 ms vs ~114 ms). Kept as contention insurance for the production
+  sandbox, where the server's dev perf (108, p50 724283) shows CPU is scarcer.

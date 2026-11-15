@@ -246,20 +246,20 @@ export function readPack(
         byte = pack[pos++];
         offset = ((offset + 1) << 7) | (byte & 0x7f);
       }
-      const data = inflateSync(pack.subarray(pos));
-      pos += consumedDeflate(pack, pos);
+      const { data, consumed } = inflateObject(pack, pos);
+      pos += consumed;
       entry = { type: 'ofs-delta', data, baseOffset: start - offset };
     } else if (typeId === 7) {
       const baseOid = pack.subarray(pos, pos + 20).toString('hex');
       pos += 20;
-      const data = inflateSync(pack.subarray(pos));
-      pos += consumedDeflate(pack, pos);
+      const { data, consumed } = inflateObject(pack, pos);
+      pos += consumed;
       entry = { type: 'ref-delta', data, baseOid };
     } else {
       const type = PACK_TYPES[typeId];
       if (type === undefined) throw new Error(`unknown pack object type ${typeId}`);
-      const data = inflateSync(pack.subarray(pos));
-      pos += consumedDeflate(pack, pos);
+      const { data, consumed } = inflateObject(pack, pos);
+      pos += consumed;
       if (data.length !== size) throw new Error(`pack object size mismatch: ${data.length} != ${size}`);
       entry = { type, data };
     }
@@ -317,12 +317,13 @@ export function adler32(data: Buffer): number {
 }
 
 /**
- * Bytes the zlib stream starting at `pos` consumed. A zlib stream ends with the Adler-32 of its
- * uncompressed bytes, so the end is where those four bytes sit; a prefix inflation verifies the
- * candidate (a coincidental match inside the deflate data fails it and the search continues).
- * Falls back to a binary search when no candidate verifies.
+ * Inflate the zlib stream starting at `pos` and return its data plus the bytes the
+ * stream consumed. One full-tail inflate yields the data (and its Adler-32); one
+ * prefix inflate verifies the candidate end — two inflates per object instead of
+ * three (readPack used to inflate the tail once more before finding the end).
+ * Falls back to a binary search when no Adler-32 candidate verifies.
  */
-function consumedDeflate(pack: Buffer, pos: number): number {
+function inflateObject(pack: Buffer, pos: number): { data: Buffer; consumed: number } {
   const tail = pack.subarray(pos);
   const data = inflateSync(tail);
   const needle = Buffer.alloc(4);
@@ -331,7 +332,7 @@ function consumedDeflate(pack: Buffer, pos: number): number {
   while (idx >= 0) {
     const end = idx + 4;
     try {
-      if (inflateSync(tail.subarray(0, end)).equals(data)) return end;
+      if (inflateSync(tail.subarray(0, end)).equals(data)) return { data, consumed: end };
     } catch {
       // not the stream end; keep looking
     }
@@ -356,7 +357,7 @@ function consumedDeflate(pack: Buffer, pos: number): number {
     if (tryInflate(mid)) hi = mid;
     else lo = mid;
   }
-  return hi;
+  return { data, consumed: hi };
 }
 
 // -------------------------------------------------------------------------------------------

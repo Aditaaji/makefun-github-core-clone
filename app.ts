@@ -34,6 +34,7 @@ import {
   VIEWER_LOGIN,
   VIEWER_NAME,
   buildTree,
+  bumpGit,
   commitFiles,
   historyPresentVerified,
   isFastForward,
@@ -647,6 +648,7 @@ function handleRepoRest(req: IncomingMessage, res: ServerResponse, route: Route,
         return;
       }
       repo.refs.set(ref, sha);
+      bumpGit(repo);
       sendJson(res, 201, { ref, object: { sha, type: obj.type, url: `${base}/git/${obj.type}s/${sha}` }, url: `${base}/git/refs/${ref}` });
       return;
     }
@@ -1085,16 +1087,15 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    `agent=${AGENT}\n`,
-    'flush',
-  ]);
-}
+/** The v2 capability advertisement: identical for every repo, built once. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  `agent=${AGENT}\n`,
+  'flush',
+]);
 
 interface FetchPlan {
   objects: Map<string, GitObject>;
@@ -1309,10 +1310,17 @@ function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, s
   }
   const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
   if (wantsV2) {
-    sendBuffer(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+    sendBuffer(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
   }
-  sendBuffer(res, 200, v0Advertisement(repo, service), `application/x-${service}-advertisement`);
+  // The v0 advertisement lists the repo's refs: cache it per gitVersion (bumpGit clears it).
+  if (repo.infoRefsCache !== null && repo.infoRefsCache.version === repo.gitVersion && repo.infoRefsCache.service === service) {
+    sendBuffer(res, 200, repo.infoRefsCache.body, `application/x-${service}-advertisement`);
+    return;
+  }
+  const body = v0Advertisement(repo, service);
+  repo.infoRefsCache = { version: repo.gitVersion, service, body };
+  sendBuffer(res, 200, body, `application/x-${service}-advertisement`);
 }
 
 function parseV2Args(lines: Array<{ kind: string; payload?: Buffer }>): Record<string, string[]> {
@@ -1354,6 +1362,13 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
       const peel = args.peel !== undefined;
       const symrefs = args.symrefs !== undefined;
       const unborn = args.unborn !== undefined;
+      // The ref list is a pure function of the repo's git state; identical clones
+      // ask for the same thing, so cache it per gitVersion (bumpGit clears it).
+      const lsKey = `${prefixes.join(',')}|${peel}|${symrefs}|${unborn}`;
+      if (repo.lsRefsCache !== null && repo.lsRefsCache.version === repo.gitVersion && repo.lsRefsCache.key === lsKey) {
+        sendBuffer(res, 200, repo.lsRefsCache.body, 'application/x-git-upload-pack-result');
+        return;
+      }
       const out: string[] = [];
       const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
       const matchPrefix = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
@@ -1372,7 +1387,9 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
         }
         out.push(`${line}\n`);
       }
-      sendBuffer(res, 200, Buffer.concat([encodePktLines(out), PKT_FLUSH]), 'application/x-git-upload-pack-result');
+      const lsBody = Buffer.concat([encodePktLines(out), PKT_FLUSH]);
+      repo.lsRefsCache = { version: repo.gitVersion, key: lsKey, body: lsBody };
+      sendBuffer(res, 200, lsBody, 'application/x-git-upload-pack-result');
       return;
     }
 
@@ -1384,6 +1401,15 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
       if (args.deepen !== undefined && args.deepen.length > 0) {
         const n = Number(args.deepen[0]);
         if (Number.isFinite(n) && n >= 0) depth = Math.trunc(n);
+      }
+      // The fetch answer is a pure function of the request + the repo's git state
+      // (objects are content-addressed and append-only; refs move only via bumpGit,
+      // which clears this cache). Identical clones therefore share one pack build.
+      const cacheKey = `v2|${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}|${depth}|${repo.gitVersion}`;
+      const cached = repo.fetchCache.get(cacheKey);
+      if (cached !== undefined) {
+        sendBuffer(res, 200, cached, 'application/x-git-upload-pack-result');
+        return;
       }
       const plan = computeFetch(repo, wants, haves, shallowIn, depth);
       const pack = writePack(plan.objects);
@@ -1404,7 +1430,13 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
       parts.push(pktLine('packfile\n'));
       parts.push(sideband(pack, 1));
       parts.push(PKT_FLUSH);
-      sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const body = Buffer.concat(parts);
+      if (repo.fetchCache.size >= 16) {
+        const oldest = repo.fetchCache.keys().next().value;
+        if (oldest !== undefined) repo.fetchCache.delete(oldest);
+      }
+      repo.fetchCache.set(cacheKey, body);
+      sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
       return;
     }
 
@@ -1442,6 +1474,14 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
         if (isOid(oid)) haves.push(oid);
       }
     }
+    // Same cache as the v2 fetch (see above): the pack is a pure function of the
+    // request + the repo's git state, and bumpGit clears it on every mutation.
+    const cacheKey = `v0|${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}|${depth}|${repo.gitVersion}`;
+    const cached = repo.fetchCache.get(cacheKey);
+    if (cached !== undefined) {
+      sendBuffer(res, 200, cached, 'application/x-git-upload-pack-result');
+      return;
+    }
     const plan = computeFetch(repo, wants, haves, shallowIn, depth);
     const pack = writePack(plan.objects);
     const parts: Buffer[] = [];
@@ -1451,7 +1491,13 @@ function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo,
     for (const u of plan.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
     parts.push(sideband(pack, 1));
     parts.push(PKT_FLUSH);
-    sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    const body = Buffer.concat(parts);
+    if (repo.fetchCache.size >= 16) {
+      const oldest = repo.fetchCache.keys().next().value;
+      if (oldest !== undefined) repo.fetchCache.delete(oldest);
+    }
+    repo.fetchCache.set(cacheKey, body);
+    sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
   } catch {
     sendJson(res, 400, { message: 'malformed pkt-line stream' });
   }
@@ -1542,6 +1588,8 @@ function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repo
       results.push({ ref: c.ref, ok: true, reason: '' });
     }
   }
+  // Every ref update above changes what a fetch would serve.
+  bumpGit(repo);
   for (const r of results) {
     report.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
   }

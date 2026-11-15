@@ -110,6 +110,14 @@ export interface Repo {
   refs: Map<string, string>;
   /** Commit oids whose whole history is known present (memoizes push validation). */
   verifiedCommits: Set<string>;
+  /** Monotonic git-state version: bumped on every objects/refs mutation; caches key off it. */
+  gitVersion: number;
+  /** Cached git-upload-pack fetch responses, keyed by protocol + request + gitVersion. */
+  fetchCache: Map<string, Buffer>;
+  /** Cached ls-refs response, valid only for the gitVersion it was built at. */
+  lsRefsCache: { version: number; key: string; body: Buffer } | null;
+  /** Cached v0 info/refs advertisement, valid only for the gitVersion it was built at. */
+  infoRefsCache: { version: number; service: string; body: Buffer } | null;
   issues: Issue[];
   labels: Label[];
   pulls: PullRequest[];
@@ -154,6 +162,10 @@ export class Store {
       objects: new Map(),
       refs: new Map(),
       verifiedCommits: new Set(),
+      gitVersion: 0,
+      fetchCache: new Map(),
+      lsRefsCache: null,
+      infoRefsCache: null,
       issues: [],
       labels: [],
       pulls: [],
@@ -192,8 +204,25 @@ export class Store {
 
 export function storeObject(repo: Repo, type: GitObject['type'], data: Buffer): string {
   const oid = objectId(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    bumpGit(repo);
+  }
   return oid;
+}
+
+/**
+ * Mark the repo's git state changed: bumps gitVersion and drops the cached git
+ * smart-HTTP responses (fetch packs, ls-refs, info/refs). Callers mutate objects
+ * or refs only through storeObject / the ref updates below, plus receive-pack.
+ * Clearing is always safe (a cache miss just recomputes); a missed bump would
+ * serve a stale pack, so every mutation site must call this.
+ */
+export function bumpGit(repo: Repo): void {
+  repo.gitVersion += 1;
+  repo.fetchCache.clear();
+  repo.lsRefsCache = null;
+  repo.infoRefsCache = null;
 }
 
 export function authorLine(): string {
@@ -257,6 +286,7 @@ export function commitFiles(
   const oid = storeObject(repo, 'commit', encodeCommit(view));
   repo.verifiedCommits.add(oid);
   repo.refs.set(ref, oid);
+  bumpGit(repo);
   return oid;
 }
 
@@ -375,6 +405,7 @@ export function squashMerge(repo: Repo, pr: PullRequest): string | null {
   const oid = storeObject(repo, 'commit', encodeCommit(view));
   repo.verifiedCommits.add(oid);
   repo.refs.set(`refs/heads/${pr.baseRef}`, oid);
+  bumpGit(repo);
   return oid;
 }
 
