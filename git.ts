@@ -318,25 +318,22 @@ export function adler32(data: Buffer): number {
 
 /**
  * Inflate the zlib stream starting at `pos` and return its data plus the bytes the
- * stream consumed. One full-tail inflate yields the data (and its Adler-32); one
- * prefix inflate verifies the candidate end — two inflates per object instead of
- * three (readPack used to inflate the tail once more before finding the end).
- * Falls back to a binary search when no Adler-32 candidate verifies.
+ * stream consumed. A single inflate with `{ info: true }` reports the consumed input
+ * length on the engine (`bytesWritten`), so there is no second inflate and no
+ * Adler-32 scan to find the stream end (the old code inflated twice per object).
+ * Falls back to a binary search when the engine does not report a usable length.
  */
 function inflateObject(pack: Buffer, pos: number): { data: Buffer; consumed: number } {
   const tail = pack.subarray(pos);
-  const data = inflateSync(tail);
-  const needle = Buffer.alloc(4);
-  needle.writeUInt32BE(adler32(data), 0);
-  let idx = tail.indexOf(needle, 2);
-  while (idx >= 0) {
-    const end = idx + 4;
-    try {
-      if (inflateSync(tail.subarray(0, end)).equals(data)) return { data, consumed: end };
-    } catch {
-      // not the stream end; keep looking
-    }
-    idx = tail.indexOf(needle, idx + 1);
+  try {
+    const result = inflateSync(tail, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    const consumed = result.engine.bytesWritten;
+    if (consumed > 0 && consumed <= tail.length) return { data: result.buffer, consumed };
+  } catch {
+    // Corrupt or truncated stream: fall through to the binary search, which throws.
   }
   // Fallback: binary-search the minimal prefix that inflates cleanly.
   const tryInflate = (len: number): boolean => {
@@ -357,7 +354,7 @@ function inflateObject(pack: Buffer, pos: number): { data: Buffer; consumed: num
     if (tryInflate(mid)) hi = mid;
     else lo = mid;
   }
-  return { data, consumed: hi };
+  return { data: inflateSync(pack.subarray(pos, pos + hi)), consumed: hi };
 }
 
 // -------------------------------------------------------------------------------------------

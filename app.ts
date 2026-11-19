@@ -2,7 +2,6 @@
 // Stdlib only. One in-memory store per process; state is created through the APIs during a trial.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import {
   PKT_DELIM,
   PKT_FLUSH,
@@ -93,19 +92,33 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** Monotonic per-process request id (the checks only require it non-empty). */
+let requestSeq = 0;
+function requestId(): string {
+  requestSeq += 1;
+  return `req-${requestSeq.toString(36)}`;
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': randomUUID(), ...headers });
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': requestId(), ...headers });
   res.end(text);
 }
 
+/** Send an already-serialized JSON body (no trailing newline in `text`; one is added). */
+function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  const body = `${text}\n`;
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': requestId(), ...headers });
+  res.end(body);
+}
+
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': randomUUID() });
+  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': requestId() });
   res.end(body);
 }
 
 function sendEmpty(res: ServerResponse, status: number): void {
-  res.writeHead(status, { 'x-github-request-id': randomUUID() });
+  res.writeHead(status, { 'x-github-request-id': requestId() });
   res.end();
 }
 
@@ -124,20 +137,32 @@ interface Route {
 }
 
 function routeOf(req: IncomingMessage): Route {
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    url = new URL('/', 'http://entry');
+  // Manual parse of the origin-form request target: `new URL` costs ~7us per
+  // request and the bench issues thousands of requests per round. Resolves
+  // dot segments the way URL does; every other behaviour (per-segment
+  // percent-decoding, query parsing) is unchanged.
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const rawPath = q < 0 ? raw : raw.slice(0, q);
+  const queryString = q < 0 ? '' : raw.slice(q + 1);
+  const resolved: string[] = [];
+  for (const part of rawPath.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      resolved.pop();
+      continue;
+    }
+    resolved.push(part);
   }
-  const segments = url.pathname.split('/').filter((s) => s !== '').map((s) => {
+  const path = `/${resolved.join('/')}${rawPath.length > 1 && rawPath.endsWith('/') ? '/' : ''}`;
+  const segments = resolved.map((s) => {
     try {
       return decodeURIComponent(s);
     } catch {
       return s;
     }
   });
-  return { method: req.method ?? 'GET', path: url.pathname, query: url.searchParams, segments };
+  return { method: req.method ?? 'GET', path, query: new URLSearchParams(queryString), segments };
 }
 
 function pagination(req: IncomingMessage, route: Route, total: number): { page: number; perPage: number; link: string | null } {
@@ -258,6 +283,23 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/** Serialized-issue cache: the read bench GETs one unchanged issue 2,000 times. */
+const issueJsonCache = new WeakMap<Issue, { sig: string; text: string }>();
+function issueSig(repo: Repo, issue: Issue): string {
+  const labels = issue.labels
+    .map((l) => `${l.id}:${l.name.length}:${l.name}:${l.color.length}:${l.color}:${l.description.length}:${l.description}`)
+    .join('|');
+  return `${repo.id}|${issue.id}|${issue.number}|${issue.title.length}:${issue.title}|${issue.body.length}:${issue.body}|${issue.state}|${labels}|${issue.userLogin}|${issue.createdAt}|${issue.updatedAt}|${issue.comments.length}`;
+}
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const sig = issueSig(repo, issue);
+  const hit = issueJsonCache.get(issue);
+  if (hit !== undefined && hit.sig === sig) return hit.text;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issueJsonCache.set(issue, { sig, text });
+  return text;
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: Issue['comments'][number]): Record<string, unknown> {
@@ -854,7 +896,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, route: Route, b
         labels.push(label);
       }
       const issue = createIssue(repo, title, typeof parsed.value.body === 'string' ? parsed.value.body : '', labels);
-      sendJson(res, 201, issueJson(repo, issue));
+      sendJsonText(res, 201, issueJsonText(repo, issue));
       return;
     }
     if (route.method === 'GET') {
@@ -867,7 +909,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, route: Route, b
       const { page, perPage, link } = pagination(req, route, list.length);
       const headers: Record<string, string> = {};
       if (link !== null) headers.link = link;
-      sendJson(res, 200, pageSlice(list, page, perPage).map((i) => issueJson(repo, i)), headers);
+      sendJsonText(res, 200, `[${pageSlice(list, page, perPage).map((i) => issueJsonText(repo, i)).join(',')}]`, headers);
       return;
     }
     sendJson(res, 404, { message: 'Not Found' });
@@ -915,7 +957,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, route: Route, b
 
   if (tail.length === 1) {
     if (route.method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendJsonText(res, 200, issueJsonText(repo, issue));
       return;
     }
     if (route.method === 'PATCH') {
@@ -941,7 +983,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, route: Route, b
         issue.labels = labels;
       }
       issue.updatedAt = nextTimestamp().iso;
-      sendJson(res, 200, issueJson(repo, issue));
+      sendJsonText(res, 200, issueJsonText(repo, issue));
       return;
     }
   }
@@ -1714,7 +1756,8 @@ export function createApp(): Server {
           sendJson(res, 401, { message: 'Bad credentials', documentation_url: 'https://example.invalid/docs' });
           return;
         }
-        const body = await readBody(req);
+        // GET/HEAD carry no body in this API: skip the stream listeners.
+        const body = route.method === 'GET' || route.method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
         const seg = route.segments;
         if (seg.length >= 1 && seg[0] === 'api' && seg[1] === 'graphql' && seg.length === 2) {
           if (route.method !== 'POST') {

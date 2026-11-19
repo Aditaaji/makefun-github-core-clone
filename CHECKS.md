@@ -34,7 +34,48 @@ Command: `node cli/makefun.mjs grade-local --kit . --bot ~/workspace/makefun/git
 - ranked: yes; prize: no; efficiency: no — all three "no"s are the missing transcripts (`no_transcripts`, `coverage_below_gate`, `cost_unpriced`), fixed by bundling the build session (see TRANSCRIPTS.md).
 - Scored round: every entry runs 1 scored instance; top 60 (+ ties) run all 3, ranked on mean; must beat the house reference forge with a 90% paired t-interval > 0 to take a prize.
 
-## Perf push — grade-local 3-trial means (this session, same VM)
+## Perf push 2 — grade-local 3-trial A/B, same VM load (this session)
+
+Server CPU/op measured first (hammer, `/proc` CPU time): read 0.168 -> 0.126 ms/op
+(-25%), push 1.218 -> 1.040 ms/op (-15%), write/clone within noise. A 100us-interval
+CPU profile of push-only showed no single hotspot (GC ~10% of busy CPU, writev ~9%,
+zlib ~5%, the rest spread over HTTP machinery, hashing and handlers), so the
+remaining gains are thin.
+
+Optimizations (committed here):
+- git.ts `inflateObject`: one `inflateSync(tail, { info: true })` — the engine's
+  `bytesWritten` is the consumed input length, so no second inflate and no Adler-32
+  scan per object (isolated bench: 45.1 -> 30.3 ms per 600-object pass, -33%;
+  edge cases verified: empty blob, 1 MB blob, truncated stream throws, trailing
+  garbage ignored). Binary-search fallback kept for a missing/invalid length.
+- app.ts `routeOf`: manual request-target parse instead of `new URL` (~7 us/req),
+  dot segments resolved as URL does, per-segment percent-decoding unchanged.
+- app.ts: `x-github-request-id` is a monotonic counter instead of `randomUUID()`
+  (kit checks only require it non-empty); GET/HEAD skip the `readBody` listeners;
+  serialized-issue cache (`issueJsonText`, signature over every output field) for
+  the 2,000 identical GETs in the read workload.
+
+A/B, 3 trials each, back-to-back under the same heavy VM load (old code stashed
+for the control):
+- New code (grade-local-perf3-3t): mean **938** (perf **138**, p50 482 us) — trials 925/950/938.
+  Per-workload means: push 39, clone 31, read 35, write 33.
+- Old code (grade-local-baseline3): mean **929** (perf **129**, p50 541 us) — trials 928/924/935.
+  Per-workload means: push 37, clone 34, read 30, write 28.
+- Gain: **+9 score / +9 perf, p50 -11%**, but the 90% intervals overlap
+  (new 917–959, old 920–938) and per-workload noise is +/-5 points, so the gain is
+  real in direction (matches the CPU/op measurements) but small in magnitude.
+- A single trial run mid-session under even heavier load scored 909 (perf 109,
+  grade-local-perf3); for reference the same code measured 975–980 when the VM was
+  quiet, so local numbers move +/-50 with VM load alone.
+
+Conclusion: +28 perf (dev 123 -> 151 for rank 100) is NOT reachable by
+micro-optimization of this TypeScript entry. The gap is structural: the server
+runs ~2.2x slower than this VM (dev p50 576 us vs local ~258 us when quiet) and
+the top entries are Go+SIMD; the remaining per-request cost is Node HTTP
+machinery, GC and zlib spread thin with no dominant hotspot. A Go rewrite would
+be a different entry and is out of scope for this push.
+
+## Perf push — grade-local 3-trial means (earlier session, same VM)
 
 Baseline fresh (grade-local-baseline, HEAD adf0163, VM loaded by other builders):
 mean 918 (perf 118, p50 630993) — push 1125 ms, clone 283 ms, read 1921 ms, write 262 ms.
